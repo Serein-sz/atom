@@ -2,6 +2,7 @@ import asyncio
 from typing import List
 
 import typer
+from dotenv import load_dotenv
 from rich import print
 from rich.markdown import Markdown
 
@@ -14,6 +15,8 @@ from .utils.git import (
 
 from .agents import task_agent
 
+load_dotenv()
+
 app = typer.Typer()
 
 
@@ -23,7 +26,10 @@ def dump():
 
 
 @app.command()
-def task(offset: int = 0, author: str = "王强"):
+def task(
+    offset: int = 0,
+    author: str = "王强",
+):
     commits = load_commits_by_author(author)
     task_group: List[TaskGroup] = group_commits_to_task_groups(commits)
     for task in task_group[0 : offset + 1]:
