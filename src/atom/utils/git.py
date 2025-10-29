@@ -10,9 +10,13 @@ import typer
 import requests
 from bs4 import BeautifulSoup  # pip install beautifulsoup4
 from bs4.element import ResultSet, Tag
+from rich.progress import Progress, TaskID, MofNCompleteColumn, TimeElapsedColumn
+from rich.console import Console
 
 
 from atom.entity import Commit, TaskGroup, Task
+
+console = Console()
 
 
 def fetch_repositories(host: str) -> list[str]:
@@ -31,8 +35,24 @@ def fetch_repositories(host: str) -> list[str]:
     return result
 
 
-async def fetch_repository_commits(host: str, repository: str) -> list[Commit]:
-    url = f"http://{host}/log/{repository}.git"
+def fetch_branches(host: str, repository: str) -> list[str]:
+    url = f"http://{host}/branches/{repository}.git"
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    branches = soup.select(
+        "body > div:nth-child(4) > div > table > tbody > tr > td:nth-child(2) > span > a"
+    )
+    result: list[str] = []
+    for branch in branches:
+        result.append(branch.attrs["href"])
+    return result
+
+
+async def fetch_repository_commits(
+    progress: Progress, task: TaskID, host: str, repository: str, branch: str
+) -> list[Commit]:
+    url = f"http://{host}/{branch.replace('../', '')}"
     page = 1
     result: list[Commit] = []
     while True:
@@ -53,9 +73,7 @@ async def fetch_repository_commits(host: str, repository: str) -> list[Commit]:
         result.extend(processed_commits)
         page += 1
         await asyncio.sleep(0.5)
-    typer.secho(
-        message=f"Successfully process {repository}.git ...", fg=typer.colors.MAGENTA
-    )
+    progress.update(task, advance=1)
     return result
 
 
@@ -76,15 +94,20 @@ def handle_current_page_commits(commits: ResultSet[Tag], repository: str):
     results: list[Commit] = []
     for commit in commits:
         date = commit.select_one("td.date > span").text
-        if "以前" not in date and not within_last_month(date):
+        if (
+            ("以前" not in date) and date != "昨天" and date != "刚刚"
+        ) and not within_last_month(date):
             break
+        message = commit.select_one(
+            "td.message.ellipsize > table > tr > td:nth-child(1) > span > a"
+        ).text
+        if message.startswith("Merge branch"):
+            continue
         results.append(
             Commit(
                 date=normalize_human_date(date),
                 author=commit.select_one("td.hidden-phone.author > span > a").text,
-                message=commit.select_one(
-                    "td.message.ellipsize > table > tr > td:nth-child(1) > span > a"
-                ).text,
+                message=message,
                 repository=repository,
             )
         )
@@ -98,10 +121,12 @@ def normalize_human_date(text: str, now: datetime | None = None) -> str:
     """
     now = now or datetime.now()
     text = text.strip()
+    if text == "刚刚":
+        return now.strftime("%Y-%m-%d")
 
     # 1) 已经是 yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?", text):
-        return text if ":" in text else f"{text}"
+        return text if ":" in text else f"{text} 00:00:00"
 
     # 2) N 小时以前
     m = re.match(r"(\d+)\s*小时以前", text)
@@ -136,6 +161,8 @@ def save_commits_by_author(
             author_map.setdefault(c.author, []).append(c.to_dict())
 
     for author, commits in author_map.items():
+        if "\\" in author:
+            continue
         file_path = out_dir / f"{author}.json"
         with file_path.open("w", encoding="utf-8") as fp:
             json.dump(commits, fp, ensure_ascii=False, indent=2)
@@ -144,22 +171,30 @@ def save_commits_by_author(
 async def dump_info():
     start = perf_counter()
     hosts = ["192.168.2.240:9999", "192.168.2.111:19999"]
-    repository_dict = {}
-    tasks = []
+
+    triples = []
     for host in hosts:
-        repositories = fetch_repositories(host)
-        for repository in repositories:
-            tasks.append(fetch_repository_commits(host, repository))
-            # commits = await
-            # repository_dict[repository] = commits
-    result = await asyncio.gather(*tasks)
-    # 4️⃣ 回填到 repository_dict
-    for commits in result:
-        # 从 Task 里拿回 repo 名（下面两种办法任选其一）
-        # 办法 A：fetch_repository_commits 返回的 Commit.repository 字段可信
-        if commits:
-            repo_name = commits[0].repository
-            repository_dict[repo_name] = commits
+        for repo in fetch_repositories(host):
+            for branch in fetch_branches(host, repo):
+                triples.append((host, repo, branch))
+    # 2️⃣ 用 rich 创建进度条
+    with Progress(
+        *Progress.get_default_columns(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,  # 完成后自动隐藏
+    ) as progress:
+        task = progress.add_task("[cyan]Fetching commits...", total=len(triples))
+        tasks = [
+            fetch_repository_commits(progress, task, h, r, b) for h, r, b in triples
+        ]
+        repository_dict = {}
+        for coroutine in asyncio.as_completed(tasks):
+            commits = await coroutine
+            if commits:
+                repo_name = commits[0].repository
+                repository_dict[repo_name] = commits
     end = perf_counter()
     save_commits_by_author(repository_dict)
     typer.secho(message=f"cost: {end - start} ...", fg=typer.colors.GREEN)
@@ -189,14 +224,17 @@ def group_commits_to_task_groups(commits: list[Commit]) -> List[TaskGroup]:
     day_repo_tasks: dict[str, dict[str, list[str]]] = {}
     for c in commits:
         day = c.date  # 去掉时间后缀
+        day = day.replace(" 00:00:00", "")
         repo = c.repository
         day_repo_tasks.setdefault(day, {}).setdefault(repo, []).append(c.message)
-
     # 2. 生成 Task，并记录到 (week, day) 两层结构
     week_day_tasks: dict[str, dict[str, list[Task]]] = {}
     for day, repo_msgs in sorted(day_repo_tasks.items(), reverse=True):
-        dt = datetime.strptime(day, "%Y-%m-%d")
-        week_key = dt.strftime("%Y-W%V")
+        try:
+            dt = datetime.strptime(day, "%Y-%m-%d")
+            week_key = dt.strftime("%Y-W%V")
+        except ValueError:
+            week_key = datetime.today().strftime("%Y-W%V")
 
         task_list = [
             Task(date=day, repository=repo, tasks=msgs)

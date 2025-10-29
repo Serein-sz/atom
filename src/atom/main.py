@@ -3,8 +3,10 @@ from typing import List
 
 import typer
 from dotenv import load_dotenv
-from rich import print
+from rich.console import Console
+from rich.table import Table
 from rich.markdown import Markdown
+from rich import print
 
 from .entity.task import TaskGroup
 from .utils.git import (
@@ -20,6 +22,9 @@ load_dotenv()
 app = typer.Typer()
 
 
+console = Console()
+
+
 @app.command()
 def dump():
     asyncio.run(dump_info())
@@ -33,7 +38,15 @@ def task(
     commits = load_commits_by_author(author)
     task_group: List[TaskGroup] = group_commits_to_task_groups(commits)
     for task in task_group[0 : offset + 1]:
-        print(task)
+        table = Table(title=f"Task Group (Week: {task.week})")
+        table.add_column("Date", style="cyan", no_wrap=True)
+        table.add_column("Repository", style="magenta", no_wrap=True)
+        table.add_column("Tasks", style="green", no_wrap=True)
+
+        for task in task.tasks:
+            table.add_row(str(task.date), task.repository, "\n".join(task.tasks))
+
+        console.print(table)
 
 
 @app.command()
